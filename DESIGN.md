@@ -1,0 +1,1 @@
+# Every decision you made and why, everything that surprised you, everything that failed. Short entries, written as they happen
