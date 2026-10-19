@@ -35,7 +35,7 @@ func NewAgent(client *anthropic.Client, getUserMessage func() (string, bool)) *A
 }
 
 type Agent struct {
-	client        s *anthropic.Client
+	client        *anthropic.Client
 	getUserMessage func() (string, bool)
 }
 
@@ -73,7 +73,7 @@ func (a *Agent) Run(ctx context.Context) error {
 
 func (a *Agent) runInference(ctx context.Context, conversation []anthropic.MessageParam) (*anthropic.Message, error) {
 	message, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     anthropic.ModelClaude3_7SonnetLatest,
+		Model:     anthropic.ModelClaudeOpus5_5,
 		MaxTokens: int64(1024),
 		Messages:  conversation,
 	})
