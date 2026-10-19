@@ -1,3 +1,6 @@
 | date   | start-end   | who          | tokens / $ (rough) | what we did                 | what blocked us        |
 |--------|-------------|--------------|--------------------|-----------------------------|------------------------|
-| 19 oct | 11:45-??:?? | Nikoline, Dea     | ~0k / $0.00      | setup repositoory    | mandatory log files     |
+| 19 oct | 11:45-12:30 | Nikoline, Dea     | <0k / $0.00      | setup repository    | mandatory log files     |
+| 19 oct | 12:30-13:30 | Nikoline, Dea     | <0k / $0.00      | setup Antropic key, setup Anthropic workspace, and setup fileReader functionality    | choice of Agent provider, payment issues, golang version issues, ITU firewall issues, and code syntax errors (from the guide) |
+| 19 oct | 12:30-13:30 | Nikoline, Dea     | <0k / $0.01      | setup Antropic key, setup Anthropic workspace, and setup fileReader functionality    | choice of Agent provider, payment issues, golang version issues, ITU firewall issues, and code syntax errors (from the guide) |
+| 19 oct | 15:30-15:50 | Nikoline     | <0k / $0.02      | Finish guide (list files & edit/create files) | % |
