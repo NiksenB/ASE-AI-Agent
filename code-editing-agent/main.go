@@ -41,6 +41,12 @@ type EditFileInput struct {
 	NewStr string `json:"new_str" jsonschema_description:"Text to replace old_str with"`
 }
 
+const (
+	maxIterations = 10
+	maxInputTokens  = 150000
+	maxOutputTokens = 15000
+)
+
 var ReadFileInputSchema = GenerateSchema[ReadFileInput]()
 var ListFilesInputSchema = GenerateSchema[ListFilesInput]()
 var EditFileInputSchema = GenerateSchema[EditFileInput]()
@@ -102,6 +108,9 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	fmt.Println("Chat with Claude (use 'ctrl-c' to quit)")
 
+	var iterations int
+	var inTokens, outTokens int64
+
 	readUserInput := true
 	for {
 		if readUserInput {
@@ -111,6 +120,8 @@ func (a *Agent) Run(ctx context.Context) error {
 				break
 			}
 
+			iterations, inTokens, outTokens = 0, 0, 0
+
 			userMessage := anthropic.NewUserMessage(anthropic.NewTextBlock(userInput))
 			conversation = append(conversation, userMessage)
 		}
@@ -119,6 +130,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+
+		iterations++
+		inTokens += message.Usage.InputTokens
+		outTokens += message.Usage.OutputTokens
+
 		conversation = append(conversation, message.ToParam())
 
 		toolResults := []anthropic.ContentBlockParamUnion{}
@@ -131,10 +147,18 @@ func (a *Agent) Run(ctx context.Context) error {
 				toolResults = append(toolResults, result)
 			}
 		}
-		if len(toolResults) == 0 {
+		if len(toolResults) == 0 || message.StopReason == anthropic.StopReasonEndTurn {
 			readUserInput = true
 			continue
 		}
+
+		if iterations >= maxIterations || inTokens >= maxInputTokens || outTokens >= maxOutputTokens {
+			fmt.Printf("\n[Stopped: %d calls, %d in / %d token limit exeeded agent loop. Send a message to continue.]\n",
+				iterations, inTokens, outTokens)
+			readUserInput = true
+			continue
+		}
+
 		readUserInput = false
 		conversation = append(conversation, anthropic.NewUserMessage(toolResults...))
 	}
@@ -156,7 +180,7 @@ func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.Co
 		return anthropic.NewToolResultBlock(id, "tool not found", true)
 	}
 
-	fmt.Printf("\\u001b[92mtool\\u001b[0m: %s(%s)\n", name, input)
+	fmt.Printf("\u001b[92mtool\u001b[0m: %s(%s)\n", name, input)
 	response, err := toolDef.Function(input)
 	if err != nil {
 		return anthropic.NewToolResultBlock(id, err.Error(), true)
@@ -178,7 +202,7 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 
 	message, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     anthropic.ModelClaudeSonnet5_5,
-		MaxTokens: int64(1024),
+		MaxTokens: int64(1024), //Burde måske sættes op
 		Messages:  conversation,
 		Tools:     anthropicTools,
 	})
