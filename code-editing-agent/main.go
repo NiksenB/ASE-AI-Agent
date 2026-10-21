@@ -11,7 +11,7 @@ import (
 	"strings"
 	"os/exec"
 	"runtime"
-	
+
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/invopop/jsonschema"
 )
@@ -63,10 +63,13 @@ type CompleteTodoInput struct {
 }
 
 const (
-	maxIterations = 10
+	maxIterations   = 10
 	maxInputTokens  = 150000
 	maxOutputTokens = 15000
+	compactThreshold = 200000
 )
+
+var lastContextTokens int64
 
 var ReadFileInputSchema = GenerateSchema[ReadFileInput]()
 var ListFilesInputSchema = GenerateSchema[ListFilesInput]()
@@ -171,6 +174,17 @@ func (a *Agent) Run(ctx context.Context) error {
 			conversation = append(conversation, userMessage)
 		}
 
+		if lastContextTokens >= compactThreshold {
+			compacted, err := a.compact(ctx, conversation)
+			if err != nil {
+				fmt.Printf("[compaction failed: %v]\n", err)
+			} else {
+				conversation = compacted
+				fmt.Println("[Conversation compacted]")
+			}
+			lastContextTokens = 0
+		}
+
 		message, err := a.runInference(ctx, conversation)
 		if err != nil {
 			return err
@@ -179,6 +193,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		iterations++
 		inTokens += message.Usage.InputTokens
 		outTokens += message.Usage.OutputTokens
+		lastContextTokens = message.Usage.InputTokens + message.Usage.OutputTokens
 
 		conversation = append(conversation, message.ToParam())
 		truncated := message.StopReason == anthropic.StopReasonMaxTokens
@@ -195,8 +210,8 @@ func (a *Agent) Run(ctx context.Context) error {
 						"Your output was cut off by the token limit, so this call was incomplete. Write smaller files or split the work into several calls.", true)
 				} else {
 					result = a.executeTool(content.ID, content.Name, content.Input)
-				}	
-				
+				}
+
 				toolResults = append(toolResults, result)
 			}
 		}
@@ -212,7 +227,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			readUserInput = true
 			continue
 		}
-		
+
 		conversation = append(conversation, anthropic.NewUserMessage(toolResults...))
 
 		if iterations >= maxIterations || inTokens >= maxInputTokens || outTokens >= maxOutputTokens {
@@ -254,7 +269,7 @@ func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.Co
 	return anthropic.NewToolResultBlock(id, response, false)
 }
 
-func (a *Agent) runInference(ctx context.Context, conversation []anthropic.MessageParam) (*anthropic.Message, error) {
+func (a *Agent) anthropicTools() []anthropic.ToolUnionParam {
 	anthropicTools := []anthropic.ToolUnionParam{}
 	for _, tool := range a.tools {
 		anthropicTools = append(anthropicTools, anthropic.ToolUnionParam{
@@ -265,18 +280,67 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 			},
 		})
 	}
+	return anthropicTools
+}
 
+func (a *Agent) runInference(ctx context.Context, conversation []anthropic.MessageParam) (*anthropic.Message, error) {
 	message, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     anthropic.ModelClaudeSonnet5_5,
 		MaxTokens: int64(4096), //Burde måske sættes op
 		Messages:  conversation,
-		Tools:     anthropicTools,
-		System: []anthropic.TextBlockParam{{
-			Text: "You are running on " + shellDescription() + "\n" +
-				"For simple questions or conversation, answer directly. For any multi-step task, first call set_todos with the goals, do the work, and call complete_todo for each goal only after verifying it. Do not give a final answer to a multi-step task until all its goals are complete.",
-		}},
+		Tools:     a.anthropicTools(),
+		System:    systemPrompt(),
 	})
 	return message, err
+}
+
+// Placed outside to not create a 400 Bad Request. 
+// systemPrompts are cryptographically bound to the system prompt they were created under.
+// so this created problems for the summary function that is a different prompt (:
+func systemPrompt() []anthropic.TextBlockParam {
+	return []anthropic.TextBlockParam{{
+		Text: "You are running on " + shellDescription() + "\n" +
+			"For simple questions or conversation, answer directly. For any multi-step task, first call set_todos with the goals, do the work, and call complete_todo for each goal only after verifying it. Do not give a final answer to a multi-step task until all its goals are complete.",
+	}}
+}
+
+const summaryPrompt = `Summarize this conversation so work can continue from the summary alone.
+Include: the user's goals, what has been done (files changed, commands run, results),
+key decisions and facts, and what remains to be done. Be concise but complete.`
+
+func (a *Agent) compact(ctx context.Context, conversation []anthropic.MessageParam) ([]anthropic.MessageParam, error) {
+	msgs := append([]anthropic.MessageParam{}, conversation...)
+	msgs = append(msgs, anthropic.NewUserMessage(anthropic.NewTextBlock(summaryPrompt)))
+
+	resp, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaudeSonnet5_5,
+		MaxTokens: int64(2048),
+		Messages:  msgs,
+		System:    systemPrompt(), 
+		Tools:      a.anthropicTools(),
+		ToolChoice: anthropic.ToolChoiceUnionParam{OfNone: &anthropic.ToolChoiceNoneParam{}},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var sb strings.Builder
+	for _, c := range resp.Content {
+		if c.Type == "text" {
+			sb.WriteString(c.Text)
+		}
+	}
+	if sb.Len() == 0 {
+		return nil, fmt.Errorf("empty summary")
+	}
+
+	text := "Summary of the conversation so far:\n\n" + sb.String()
+	if t := renderTodos(); t != "" {
+		text += "\n\nCurrent goals:\n" + t
+	}
+	text += "\nContinue from here."
+
+	return []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock(text))}, nil
 }
 
 func GenerateSchema[T any]() anthropic.ToolInputSchemaParam {
@@ -361,7 +425,7 @@ func EditFile(input json.RawMessage) (string, error) {
 	}
 
 	if editFileInput.Path == "" {
-	return "", fmt.Errorf("path is required")
+		return "", fmt.Errorf("path is required")
 	}
 	if editFileInput.OldStr == editFileInput.NewStr {
 		return "", fmt.Errorf("old_str and new_str are identical or both empty; to create a file, set old_str to \"\" and put the full content in new_str")
@@ -406,7 +470,6 @@ func createNewFile(filePath, content string) (string, error) {
 
 	return fmt.Sprintf("Successfully created file %s", filePath), nil
 }
-
 
 func SetTodos(input json.RawMessage) (string, error) {
 	var in SetTodosInput
@@ -490,7 +553,7 @@ func requestPermission(code string) bool {
 	fmt.Printf("Do you want to execute the following code? (yes/no): \n%s\n", code)
 	stdin.Scan()
 	response := stdin.Text()
-    switch strings.ToLower(strings.TrimSpace(response)) {
+	switch strings.ToLower(strings.TrimSpace(response)) {
 	case "y", "yes":
 		return true
 	}
