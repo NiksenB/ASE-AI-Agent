@@ -157,7 +157,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	readUserInput := true
 	for {
 		if readUserInput {
-			fmt.Print("You: ")
+			fmt.Print("\u001b[94mYou\u001b[0m: ")
 			userInput, ok := a.getUserMessage()
 			if !ok {
 				break
@@ -187,7 +187,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		for _, content := range message.Content {
 			switch content.Type {
 			case "text":
-				fmt.Printf("Claude: %s\n", content.Text)
+				fmt.Printf("\u001b[93mClaude\u001b[0m: %s\n", content.Text)
 			case "tool_use":
 				var result anthropic.ContentBlockParamUnion
 				if truncated {
@@ -216,7 +216,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		conversation = append(conversation, anthropic.NewUserMessage(toolResults...))
 
 		if iterations >= maxIterations || inTokens >= maxInputTokens || outTokens >= maxOutputTokens {
-			fmt.Printf("\n[Stopped: %d calls, %d in / %d token limit exeeded agent loop. Send a message to continue.]\n",
+			fmt.Printf("\n[Stopped: %d calls, %d in / %d out tokens used. Token limit exeeded agent loop. Send a message to continue.]\n",
 				iterations, inTokens, outTokens)
 			readUserInput = true
 			continue
@@ -245,7 +245,11 @@ func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.Co
 	fmt.Printf("\u001b[92mtool\u001b[0m: %s(%s)\n", name, input)
 	response, err := toolDef.Function(input)
 	if err != nil {
-		return anthropic.NewToolResultBlock(id, err.Error(), true)
+		msg := err.Error()
+		if response != "" {
+			msg = response + "\n" + msg
+		}
+		return anthropic.NewToolResultBlock(id, msg, true)
 	}
 	return anthropic.NewToolResultBlock(id, response, false)
 }
@@ -268,7 +272,8 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 		Messages:  conversation,
 		Tools:     anthropicTools,
 		System: []anthropic.TextBlockParam{{
-			Text: "For any task, first call set_todos with the goals. Do the work, and call complete_todo for each goal only after verifying it. Do not give a final answer until all goals are complete.",
+			Text: "You are running on " + shellDescription() + "\n" +
+				"For simple questions or conversation, answer directly. For any multi-step task, first call set_todos with the goals, do the work, and call complete_todo for each goal only after verifying it. Do not give a final answer to a multi-step task until all its goals are complete.",
 		}},
 	})
 	return message, err
