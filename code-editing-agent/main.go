@@ -175,7 +175,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			case "text":
 				fmt.Printf("Claude: %s\n", content.Text)
 			case "tool_use":
-				result := a.executeTool(content.ID, content.Name, content.Input)
+				var result anthropic.ContentBlockParamUnion
 				if truncated {
 					result = anthropic.NewToolResultBlock(content.ID,
 						"Your output was cut off by the token limit, so this call was incomplete. Write smaller files or split the work into several calls.", true)
