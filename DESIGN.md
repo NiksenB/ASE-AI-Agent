@@ -11,3 +11,6 @@ To increase confidence that a task has succsesfully been completed a local in me
 An "in memory" todo list was picked over having e.g. a todo.md as it was deemed fitting for this project of creating a simple AI agent as task todolists likely would never be of a size that would become a problem.
 
 The code for this was implemented using Claude Sonnet 5.5. 
+
+## 21 oct: Shell execution
+It is a requirement for the agent to be able to run code in the shell, but the exact commands available varies by execution environment. How to ensure the Agent has all necessary information, without wasting resources with additional 'rountrips' when the Agent determines that it wants to execute something? For now, the runtime is determined for all Agent clients, though it is sometimes redundany, but no additional 'rountrips' are made between the user and the AI. 

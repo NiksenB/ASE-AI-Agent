@@ -9,6 +9,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"os/exec"
+	"runtime"
 	
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/invopop/jsonschema"
@@ -41,6 +43,10 @@ type EditFileInput struct {
 	NewStr string `json:"new_str" jsonschema_description:"Text to replace old_str with"`
 }
 
+type ExecuteCodeInput struct {
+	Code string `json:"code" jsonschema_description:"The code to execute."`
+}
+
 type Todo struct {
 	Text string
 	Done bool
@@ -65,6 +71,7 @@ const (
 var ReadFileInputSchema = GenerateSchema[ReadFileInput]()
 var ListFilesInputSchema = GenerateSchema[ListFilesInput]()
 var EditFileInputSchema = GenerateSchema[EditFileInput]()
+var ExecuteCodeInputSchema = GenerateSchema[ExecuteCodeInput]()
 
 var ReadFileDefinition = ToolDefinition{
 	Name:        "read_file",
@@ -103,18 +110,26 @@ var CompleteTodoDefinition = ToolDefinition{
 	Function:    CompleteTodo,
 }
 
+var ExecuteCodeDefinition = ToolDefinition{
+	Name:        "execute_code",
+	Description: "Execute a single shell command line and return its output. The OS and shell are stated in the system prompt. The user is asked to confirm before it runs.",
+	InputSchema: GenerateSchema[ExecuteCodeInput](),
+	Function:    ExecuteCode,
+}
+
+var stdin = bufio.NewScanner(os.Stdin)
+
 func main() {
 	client := anthropic.NewClient()
 
-	scanner := bufio.NewScanner(os.Stdin)
 	getUserMessage := func() (string, bool) {
-		if !scanner.Scan() {
+		if !stdin.Scan() {
 			return "", false
 		}
-		return scanner.Text(), true
+		return stdin.Text(), true
 	}
 
-	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition, EditFileDefinition, SetTodosDefinition, CompleteTodoDefinition}
+	tools := []ToolDefinition{ReadFileDefinition, ListFilesDefinition, EditFileDefinition, SetTodosDefinition, CompleteTodoDefinition, ExecuteCodeDefinition}
 	agent := NewAgent(&client, getUserMessage, tools)
 	err := agent.Run(context.TODO())
 	if err != nil {
@@ -130,7 +145,6 @@ func NewAgent(client *anthropic.Client, getUserMessage func() (string, bool), to
 	}
 }
 
-
 func (a *Agent) Run(ctx context.Context) error {
 	conversation := []anthropic.MessageParam{}
 
@@ -143,7 +157,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	readUserInput := true
 	for {
 		if readUserInput {
-			fmt.Print("You: ")
+			fmt.Print("\u001b[94mYou\u001b[0m: ")
 			userInput, ok := a.getUserMessage()
 			if !ok {
 				break
@@ -173,9 +187,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		for _, content := range message.Content {
 			switch content.Type {
 			case "text":
-				fmt.Printf("Claude: %s\n", content.Text)
+				fmt.Printf("\u001b[93mClaude\u001b[0m: %s\n", content.Text)
 			case "tool_use":
-				result := a.executeTool(content.ID, content.Name, content.Input)
+				var result anthropic.ContentBlockParamUnion
 				if truncated {
 					result = anthropic.NewToolResultBlock(content.ID,
 						"Your output was cut off by the token limit, so this call was incomplete. Write smaller files or split the work into several calls.", true)
@@ -202,7 +216,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		conversation = append(conversation, anthropic.NewUserMessage(toolResults...))
 
 		if iterations >= maxIterations || inTokens >= maxInputTokens || outTokens >= maxOutputTokens {
-			fmt.Printf("\n[Stopped: %d calls, %d in / %d token limit exeeded agent loop. Send a message to continue.]\n",
+			fmt.Printf("\n[Stopped: %d calls, %d in / %d out tokens used. Token limit exeeded agent loop. Send a message to continue.]\n",
 				iterations, inTokens, outTokens)
 			readUserInput = true
 			continue
@@ -231,7 +245,11 @@ func (a *Agent) executeTool(id, name string, input json.RawMessage) anthropic.Co
 	fmt.Printf("\u001b[92mtool\u001b[0m: %s(%s)\n", name, input)
 	response, err := toolDef.Function(input)
 	if err != nil {
-		return anthropic.NewToolResultBlock(id, err.Error(), true)
+		msg := err.Error()
+		if response != "" {
+			msg = response + "\n" + msg
+		}
+		return anthropic.NewToolResultBlock(id, msg, true)
 	}
 	return anthropic.NewToolResultBlock(id, response, false)
 }
@@ -254,7 +272,8 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 		Messages:  conversation,
 		Tools:     anthropicTools,
 		System: []anthropic.TextBlockParam{{
-			Text: "For any task, first call set_todos with the goals. Do the work, and call complete_todo for each goal only after verifying it. Do not give a final answer until all goals are complete.",
+			Text: "You are running on " + shellDescription() + "\n" +
+				"For simple questions or conversation, answer directly. For any multi-step task, first call set_todos with the goals, do the work, and call complete_todo for each goal only after verifying it. Do not give a final answer to a multi-step task until all its goals are complete.",
 		}},
 	})
 	return message, err
@@ -433,4 +452,54 @@ func openTodos() string {
 		}
 	}
 	return sb.String()
+}
+
+func ExecuteCode(input json.RawMessage) (string, error) {
+	var in ExecuteCodeInput
+	if err := json.Unmarshal(input, &in); err != nil {
+		return "", err
+	}
+
+	permission := requestPermission(in.Code)
+
+	if !permission {
+		return "", fmt.Errorf("execution denied")
+	}
+
+	var cmd *exec.Cmd
+
+	if runtime.GOOS == "windows" {
+		// cmd.exe:  /C = run the command, then exit
+		cmd = exec.Command("cmd", "/C", in.Code)
+
+		// PowerShell version:
+		// cmd = exec.Command("powershell", "-NoProfile", "-Command", command)
+	} else {
+		cmd = exec.Command("sh", "-c", in.Code)
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(output), fmt.Errorf("execution failed: %w", err)
+	}
+
+	return string(output), nil
+}
+
+func requestPermission(code string) bool {
+	fmt.Printf("Do you want to execute the following code? (yes/no): \n%s\n", code)
+	stdin.Scan()
+	response := stdin.Text()
+    switch strings.ToLower(strings.TrimSpace(response)) {
+	case "y", "yes":
+		return true
+	}
+	return false
+}
+
+func shellDescription() string {
+	if runtime.GOOS == "windows" {
+		return "Windows (cmd.exe). Each call is a fresh shell; cd does not persist."
+	}
+	return runtime.GOOS + " (sh). Each call is a fresh shell; cd does not persist."
 }
