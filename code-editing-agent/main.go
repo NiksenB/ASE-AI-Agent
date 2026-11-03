@@ -69,6 +69,9 @@ const (
 	compactThreshold = 200000
 )
 
+var model = anthropic.ModelClaudeSonnet5_5
+var trackingFilePath = "track-output-provanance\ai-stamps.md"
+
 var lastContextTokens int64
 
 var ReadFileInputSchema = GenerateSchema[ReadFileInput]()
@@ -285,7 +288,7 @@ func (a *Agent) anthropicTools() []anthropic.ToolUnionParam {
 
 func (a *Agent) runInference(ctx context.Context, conversation []anthropic.MessageParam) (*anthropic.Message, error) {
 	message, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     anthropic.ModelClaudeSonnet5_5,
+		Model:     model,
 		MaxTokens: int64(4096), //Burde måske sættes op
 		Messages:  conversation,
 		Tools:     a.anthropicTools(),
@@ -451,6 +454,11 @@ func EditFile(input json.RawMessage) (string, error) {
 		return "", err
 	}
 
+	_, err := documentFileReview(editFileInput.Path)
+	if err != nil {
+		return "", err
+	}
+
 	return "OK", nil
 }
 
@@ -468,7 +476,46 @@ func createNewFile(filePath, content string) (string, error) {
 		return "", fmt.Errorf("failed to create file: %w", err)
 	}
 
+	_, err := documentNewFile(filePath)
+	if err != nil {
+		return "", err
+	}
+
 	return fmt.Sprintf("Successfully created file %s", filePath), nil
+}
+
+// Append the new file path to the tracking file
+// Format: | artifact_name | created_by | created_on | last_reviewed_by | last_reviewed_on |
+func documentNewFile(filePath string) (string, error) {
+	trackingEntry := fmt.Sprintf("| %s | %s | %s | - | - |\n", filePath, model, time.Now().Format("02-01-2006"))
+	f, err := os.OpenFile(trackingFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Sprintf("Failed to open tracking file: %v", err), err
+	}
+	defer f.Close()
+
+	_, err = f.WriteString(trackingEntry)
+	if err != nil {
+		return fmt.Sprintf("Failed to write to tracking file: %v", err), err
+	}
+
+	return fmt.Sprintf("Documented new file: %s", filePath), nil
+}
+
+// Modify the tracking entry to include the last reviewed by and last reviewed on fields
+func documentFileReview(filePath string) (string, error) {
+	trackingEntry := fmt.Sprintf("| %s | %s | %s | - | %s |\n", filePath, model, time.Now().Format("02-01-2006"), time.Now().Format("02-01-2006"))
+	f, err := os.OpenFile(trackingFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Sprintf("Failed to open tracking file: %v", err), err
+	}
+	defer f.Close()
+
+	_, err = f.WriteString(trackingEntry)
+	if err != nil {
+		return fmt.Sprintf("Failed to write to tracking file: %v", err), err
+	}
+	return fmt.Sprintf("Documented file review: %s", filePath), nil
 }
 
 func SetTodos(input json.RawMessage) (string, error) {
