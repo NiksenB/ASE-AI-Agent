@@ -6,15 +6,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
-	"strings"
-	"os/exec"
 	"runtime"
+	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/invopop/jsonschema"
 )
+
+var cortiModel = anthropic.Model("corti-s1")
+
+const cortiBaseURL = "https://ai.eu.corti.app/anthropic"
 
 type ToolDefinition struct {
 	Name        string                         //`json:"name"`
@@ -123,7 +128,9 @@ var ExecuteCodeDefinition = ToolDefinition{
 var stdin = bufio.NewScanner(os.Stdin)
 
 func main() {
-	client := anthropic.NewClient()
+	client := anthropic.NewClient(
+		option.WithBaseURL(cortiBaseURL),
+	)
 
 	getUserMessage := func() (string, bool) {
 		if !stdin.Scan() {
@@ -285,7 +292,7 @@ func (a *Agent) anthropicTools() []anthropic.ToolUnionParam {
 
 func (a *Agent) runInference(ctx context.Context, conversation []anthropic.MessageParam) (*anthropic.Message, error) {
 	message, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     anthropic.ModelClaudeSonnet5_5,
+		Model:     cortiModel,
 		MaxTokens: int64(4096), //Burde måske sættes op
 		Messages:  conversation,
 		Tools:     a.anthropicTools(),
@@ -313,7 +320,7 @@ func (a *Agent) compact(ctx context.Context, conversation []anthropic.MessagePar
 	msgs = append(msgs, anthropic.NewUserMessage(anthropic.NewTextBlock(summaryPrompt)))
 
 	resp, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     anthropic.ModelClaudeSonnet5_5,
+		Model:     cortiModel,
 		MaxTokens: int64(2048),
 		Messages:  msgs,
 		System:    systemPrompt(), 
@@ -440,7 +447,7 @@ func EditFile(input json.RawMessage) (string, error) {
 	}
 
 	oldContent := string(content)
-	newContent := strings.Replace(oldContent, editFileInput.OldStr, editFileInput.NewStr, -1)
+	newContent := strings.ReplaceAll(oldContent, editFileInput.OldStr, editFileInput.NewStr)
 
 	if oldContent == newContent && editFileInput.OldStr != "" {
 		return "", fmt.Errorf("old_str not found in file")
