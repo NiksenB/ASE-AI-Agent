@@ -65,6 +65,11 @@ type CompleteTodoInput struct {
 	Index int `json:"index" jsonschema_description:"1-based index of the goal that is now done and verified."`
 }
 
+type tokenUsage struct {
+	InputTokens  int64
+	OutputTokens int64
+}
+
 const (
 	maxIterations    = 10
 	maxInputTokens   = 150000
@@ -75,10 +80,10 @@ const (
 // Email used as the git *author* of AI commits. The author name is the exact
 // model version, so `git blame` shows which model wrote each line.
 // The committer stays the human (from their normal git config).
-const aiAuthorEmail = "ai-agent@example.invalid"
+const aiAuthorEmail = "noreply@anthropic.com"
 
 //var model = anthropic.ModelClaudeSonnet5_5
-var model = anthropic.ModelClaudeHaiku4_5
+var model = anthropic.ModelClaudeHaiku5_5
 
 var lastContextTokens int64
 
@@ -89,6 +94,20 @@ var (
 	repoRoot      string // git top-level directory
 	gitEnabled    bool   // false if the working directory is not inside a git repo
 )
+
+var (
+	lastUsage tokenUsage
+	promptUsage tokenUsage
+	lastResponseID string
+)
+
+// USD per million tokens: {input, output}. Keyed by model-version prefix.
+// Based on https://platform.claude.com/docs/en/about-claude/pricing (2026-11-05)
+var pricePerMTok = map[string][2]float64{
+	"claude-haiku-5-5": {0.10, 0.50}, // up to 100.000 tokens, then 0.5 / 2.5 per 1M tokens
+	"claude-sonnet-5-5": {2.00, 10.00},
+}
+
 
 var ReadFileInputSchema = GenerateSchema[ReadFileInput]()
 var ListFilesInputSchema = GenerateSchema[ListFilesInput]()
@@ -220,6 +239,10 @@ func (a *Agent) Run(ctx context.Context) error {
 		inTokens += message.Usage.InputTokens
 		outTokens += message.Usage.OutputTokens
 		lastContextTokens = message.Usage.InputTokens + message.Usage.OutputTokens
+
+		lastUsage = tokenUsage{message.Usage.InputTokens, message.Usage.OutputTokens}
+		promptUsage = tokenUsage{inTokens, outTokens}
+		lastResponseID = message.ID
 
 		conversation = append(conversation, message.ToParam())
 		truncated := message.StopReason == anthropic.StopReasonMaxTokens
@@ -641,6 +664,15 @@ func commitAI(files []string, subject, detailLabel, detail, tool, note string) e
 	// Trailers must be the last paragraph.
 	sb.WriteString("AI-Model: " + version + "\n")
 	sb.WriteString("AI-Tool: " + tool + "\n")
+	sb.WriteString("AI-Response: " + lastResponseID + "\n")
+	sb.WriteString(fmt.Sprintf("AI-Tokens: %d in / %d out\n", lastUsage.InputTokens, lastUsage.OutputTokens))
+	sb.WriteString(fmt.Sprintf("AI-Tokens-Prompt-Total: %d in / %d out\n", promptUsage.InputTokens, promptUsage.OutputTokens))
+	if c, ok := estimateCostUSD(version, lastUsage); ok {
+		sb.WriteString(fmt.Sprintf("AI-Cost-USD: %.4f\n", c))
+	}
+	if c, ok := estimateCostUSD(version, promptUsage); ok {
+		sb.WriteString(fmt.Sprintf("AI-Cost-USD-Prompt-Total: %.4f\n", c))
+	}
 	if note != "" {
 		sb.WriteString("AI-Note: " + note + "\n")
 	}
@@ -861,4 +893,13 @@ func shellDescription() string {
 		return "Windows (cmd.exe). Each call is a fresh shell; cd does not persist."
 	}
 	return runtime.GOOS + " (sh). Each call is a fresh shell; cd does not persist."
+}
+
+func estimateCostUSD(modelVersion string, u tokenUsage) (float64, bool) {
+	for prefix, p := range pricePerMTok {
+		if strings.HasPrefix(modelVersion, prefix) {
+			return (float64(u.InputTokens)*p[0] + float64(u.OutputTokens)*p[1]) / 1e6, true
+		}
+	}
+	return 0, false
 }
