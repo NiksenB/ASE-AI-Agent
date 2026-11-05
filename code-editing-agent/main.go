@@ -25,7 +25,7 @@ type ToolDefinition struct {
 }
 
 type Agent struct {
-	client        *anthropic.Client
+	client         *anthropic.Client
 	getUserMessage func() (string, bool)
 	tools          []ToolDefinition
 }
@@ -64,9 +64,9 @@ type CompleteTodoInput struct {
 }
 
 const (
-	maxIterations   = 10
-	maxInputTokens  = 150000
-	maxOutputTokens = 15000
+	maxIterations    = 10
+	maxInputTokens   = 150000
+	maxOutputTokens  = 15000
 	compactThreshold = 200000
 )
 
@@ -98,7 +98,8 @@ var ListFilesDefinition = ToolDefinition{
 var EditFileDefinition = ToolDefinition{
 	Name: "edit_file",
 	Description: `Make edits to a text file.
-	Replaces 'old_str' with 'new_str' in the given file. 'old_str' and 'new_str' MUST be different from each other.\n\nIf the file specified with path doesn't exist, it will be created.
+	Replaces 'old_str' with 'new_str' in the given file. 'old_str' and 'new_str' MUST be different from each other, and 'old_str' must match exactly one place in the file.
+	If the file specified with path doesn't exist, it will be created (set old_str to "" and put the full content in new_str).
 	`,
 	InputSchema: EditFileInputSchema,
 	Function:    EditFile,
@@ -299,7 +300,7 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 	return message, err
 }
 
-// Placed outside to not create a 400 Bad Request. 
+// Placed outside to not create a 400 Bad Request.
 // systemPrompts are cryptographically bound to the system prompt they were created under.
 // so this created problems for the summary function that is a different prompt (:
 func systemPrompt() []anthropic.TextBlockParam {
@@ -318,10 +319,10 @@ func (a *Agent) compact(ctx context.Context, conversation []anthropic.MessagePar
 	msgs = append(msgs, anthropic.NewUserMessage(anthropic.NewTextBlock(summaryPrompt)))
 
 	resp, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     anthropic.ModelClaudeSonnet5_5,
-		MaxTokens: int64(2048),
-		Messages:  msgs,
-		System:    systemPrompt(), 
+		Model:      anthropic.ModelClaudeSonnet5_5,
+		MaxTokens:  int64(2048),
+		Messages:   msgs,
+		System:     systemPrompt(),
 		Tools:      a.anthropicTools(),
 		ToolChoice: anthropic.ToolChoiceUnionParam{OfNone: &anthropic.ToolChoiceNoneParam{}},
 	})
