@@ -24,7 +24,7 @@ function take(n, iterable) {
 const count = parseInt(process.argv[2], 10) || 20;
 
 const sequence = take(count, fibonacci());
-const heartify = (text) => String(text).replace(/2/g, "❤️");
+const heartify = (text) => String(text).replace(/2/g, "❤");
 
 console.log(heartify(`First ${count} Fibonacci numbers:`));
 console.log(heartify(sequence.join(", ")));
