@@ -2,15 +2,18 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
-	"path"
-	"path/filepath"
-	"strings"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/invopop/jsonschema"
@@ -24,7 +27,7 @@ type ToolDefinition struct {
 }
 
 type Agent struct {
-	client        *anthropic.Client
+	client         *anthropic.Client
 	getUserMessage func() (string, bool)
 	tools          []ToolDefinition
 }
@@ -62,14 +65,49 @@ type CompleteTodoInput struct {
 	Index int `json:"index" jsonschema_description:"1-based index of the goal that is now done and verified."`
 }
 
+type tokenUsage struct {
+	InputTokens  int64
+	OutputTokens int64
+}
+
 const (
-	maxIterations   = 10
-	maxInputTokens  = 150000
-	maxOutputTokens = 15000
+	maxIterations    = 10
+	maxInputTokens   = 150000
+	maxOutputTokens  = 15000
 	compactThreshold = 200000
 )
 
+// Email used as the git *author* of AI commits. The author name is the exact
+// model version, so `git blame` shows which model wrote each line.
+// The committer stays the human (from their normal git config).
+const aiAuthorEmail = "noreply@anthropic.com"
+
+//var model = anthropic.ModelClaudeSonnet5_5
+var model = anthropic.ModelClaudeHaiku5_5
+
 var lastContextTokens int64
+
+// Provenance context, read by the tools when they commit.
+var (
+	currentPrompt string // the user's latest prompt (kept even after compaction)
+	currentModel  string // exact model version reported by the API for the latest response
+	repoRoot      string // git top-level directory
+	gitEnabled    bool   // false if the working directory is not inside a git repo
+)
+
+var (
+	lastUsage tokenUsage
+	promptUsage tokenUsage
+	lastResponseID string
+)
+
+// USD per million tokens: {input, output}. Keyed by model-version prefix.
+// Based on https://platform.claude.com/docs/en/about-claude/pricing (2026-11-05)
+var pricePerMTok = map[string][2]float64{
+	"claude-haiku-5-5": {0.10, 0.50}, // up to 100.000 tokens, then 0.5 / 2.5 per 1M tokens
+	"claude-sonnet-5-5": {2.00, 10.00},
+}
+
 
 var ReadFileInputSchema = GenerateSchema[ReadFileInput]()
 var ListFilesInputSchema = GenerateSchema[ListFilesInput]()
@@ -93,7 +131,8 @@ var ListFilesDefinition = ToolDefinition{
 var EditFileDefinition = ToolDefinition{
 	Name: "edit_file",
 	Description: `Make edits to a text file.
-	Replaces 'old_str' with 'new_str' in the given file. 'old_str' and 'new_str' MUST be different from each other.\n\nIf the file specified with path doesn't exist, it will be created.
+	Replaces 'old_str' with 'new_str' in the given file. 'old_str' and 'new_str' MUST be different from each other, and 'old_str' must match exactly one place in the file.
+	If the file specified with path doesn't exist, it will be created (set old_str to "" and put the full content in new_str).
 	`,
 	InputSchema: EditFileInputSchema,
 	Function:    EditFile,
@@ -124,6 +163,8 @@ var stdin = bufio.NewScanner(os.Stdin)
 
 func main() {
 	client := anthropic.NewClient()
+
+	initGit()
 
 	getUserMessage := func() (string, bool) {
 		if !stdin.Scan() {
@@ -169,6 +210,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			iterations, inTokens, outTokens = 0, 0, 0
 			verifyAttempts = 0
 			todoList = nil
+			currentPrompt = userInput
 
 			userMessage := anthropic.NewUserMessage(anthropic.NewTextBlock(userInput))
 			conversation = append(conversation, userMessage)
@@ -190,10 +232,17 @@ func (a *Agent) Run(ctx context.Context) error {
 			return err
 		}
 
+		// Exact model version that produced this response (not the alias).
+		currentModel = string(message.Model)
+
 		iterations++
 		inTokens += message.Usage.InputTokens
 		outTokens += message.Usage.OutputTokens
 		lastContextTokens = message.Usage.InputTokens + message.Usage.OutputTokens
+
+		lastUsage = tokenUsage{message.Usage.InputTokens, message.Usage.OutputTokens}
+		promptUsage = tokenUsage{inTokens, outTokens}
+		lastResponseID = message.ID
 
 		conversation = append(conversation, message.ToParam())
 		truncated := message.StopReason == anthropic.StopReasonMaxTokens
@@ -285,7 +334,7 @@ func (a *Agent) anthropicTools() []anthropic.ToolUnionParam {
 
 func (a *Agent) runInference(ctx context.Context, conversation []anthropic.MessageParam) (*anthropic.Message, error) {
 	message, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     anthropic.ModelClaudeSonnet5_5,
+		Model:     model,
 		MaxTokens: int64(4096), //Burde måske sættes op
 		Messages:  conversation,
 		Tools:     a.anthropicTools(),
@@ -294,7 +343,7 @@ func (a *Agent) runInference(ctx context.Context, conversation []anthropic.Messa
 	return message, err
 }
 
-// Placed outside to not create a 400 Bad Request. 
+// Placed outside to not create a 400 Bad Request.
 // systemPrompts are cryptographically bound to the system prompt they were created under.
 // so this created problems for the summary function that is a different prompt (:
 func systemPrompt() []anthropic.TextBlockParam {
@@ -313,10 +362,10 @@ func (a *Agent) compact(ctx context.Context, conversation []anthropic.MessagePar
 	msgs = append(msgs, anthropic.NewUserMessage(anthropic.NewTextBlock(summaryPrompt)))
 
 	resp, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     anthropic.ModelClaudeSonnet5_5,
-		MaxTokens: int64(2048),
-		Messages:  msgs,
-		System:    systemPrompt(), 
+		Model:      anthropic.ModelClaudeSonnet5_5,
+		MaxTokens:  int64(2048),
+		Messages:   msgs,
+		System:     systemPrompt(),
 		Tools:      a.anthropicTools(),
 		ToolChoice: anthropic.ToolChoiceUnionParam{OfNone: &anthropic.ToolChoiceNoneParam{}},
 	})
@@ -362,7 +411,7 @@ func ReadFile(input json.RawMessage) (string, error) {
 	readFileInput := ReadFileInput{}
 	err := json.Unmarshal(input, &readFileInput)
 	if err != nil {
-		panic(err)
+		return "", err
 	}
 
 	content, err := os.ReadFile(readFileInput.Path)
@@ -376,7 +425,7 @@ func ListFiles(input json.RawMessage) (string, error) {
 	listFilesInput := ListFilesInput{}
 	err := json.Unmarshal(input, &listFilesInput)
 	if err != nil {
-		panic(err)
+		return "", err
 	}
 
 	dir := "."
@@ -388,6 +437,11 @@ func ListFiles(input json.RawMessage) (string, error) {
 	err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
+		}
+
+		// Don't dump git internals into the model's context.
+		if info.IsDir() && info.Name() == ".git" {
+			return filepath.SkipDir
 		}
 
 		relPath, err := filepath.Rel(dir, path)
@@ -439,11 +493,23 @@ func EditFile(input json.RawMessage) (string, error) {
 		return "", err
 	}
 
-	oldContent := string(content)
-	newContent := strings.Replace(oldContent, editFileInput.OldStr, editFileInput.NewStr, -1)
+	if editFileInput.OldStr == "" {
+		return "", fmt.Errorf("file already exists; old_str must be non-empty to edit it")
+	}
 
-	if oldContent == newContent && editFileInput.OldStr != "" {
+	oldContent := string(content)
+	switch n := strings.Count(oldContent, editFileInput.OldStr); {
+	case n == 0:
 		return "", fmt.Errorf("old_str not found in file")
+	case n > 1:
+		return "", fmt.Errorf("old_str matches %d places in the file; it must match exactly one", n)
+	}
+	newContent := strings.Replace(oldContent, editFileInput.OldStr, editFileInput.NewStr, 1)
+
+	// If the file has uncommitted human changes, commit them as the human first,
+	// so they are not attributed to the AI.
+	if err := commitHumanChanges(editFileInput.Path); err != nil {
+		return "", fmt.Errorf("could not snapshot existing uncommitted changes, edit aborted: %w", err)
 	}
 
 	err = os.WriteFile(editFileInput.Path, []byte(newContent), 0644)
@@ -451,11 +517,11 @@ func EditFile(input json.RawMessage) (string, error) {
 		return "", err
 	}
 
-	return "OK", nil
+	return commitResult("OK", editFileInput.Path, "AI edit: "+editFileInput.Path, "", "", "edit_file", "")
 }
 
 func createNewFile(filePath, content string) (string, error) {
-	dir := path.Dir(filePath)
+	dir := filepath.Dir(filePath)
 	if dir != "." {
 		err := os.MkdirAll(dir, 0755)
 		if err != nil {
@@ -468,7 +534,206 @@ func createNewFile(filePath, content string) (string, error) {
 		return "", fmt.Errorf("failed to create file: %w", err)
 	}
 
-	return fmt.Sprintf("Successfully created file %s", filePath), nil
+	return commitResult(fmt.Sprintf("Successfully created file %s", filePath),
+		filePath, "AI create: "+filePath, "", "", "edit_file", "")
+}
+
+// ---------------------------------------------------------------------------
+// Git provenance tracking
+//
+// Every AI change becomes one commit:
+//   author    = exact model version (shows up in `git blame`)
+//   committer = the human (normal git config)
+//   body      = full prompt, then trailers (AI-Model, AI-Tool, AI-Note)
+//   diff      = the changed code
+//
+// Query examples:
+//   git blame <file>
+//   git log --author="claude-" --format='%h %an %s'
+//   git log --grep='some words from a prompt'
+//   git log --format='%h %(trailers:key=AI-Model,valueonly)'
+// ---------------------------------------------------------------------------
+
+func initGit() {
+	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		fmt.Println("[warning: not inside a git repository, AI provenance tracking is disabled]")
+		return
+	}
+	repoRoot = strings.TrimSpace(string(out))
+	gitEnabled = true
+}
+
+// runGit runs git from the repo root. File arguments should be absolute paths.
+func runGit(stdinText string, env []string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = repoRoot
+	cmd.Env = append(os.Environ(), env...)
+	if stdinText != "" {
+		cmd.Stdin = strings.NewReader(stdinText)
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return stdout.String(), fmt.Errorf("git %s failed: %w: %s", args[0], err,
+			strings.TrimSpace(stderr.String()+stdout.String()))
+	}
+	return stdout.String(), nil
+}
+
+// commitFiles stages and commits exactly the given files (absolute paths).
+// --only makes sure anything else the user has staged is left alone.
+// Hooks are skipped (--no-verify) because intermediate AI edits may not pass
+// linters, and a failing hook would silently lose the provenance record.
+func commitFiles(files []string, message string, env []string) error {
+	if len(files) == 0 {
+		return nil
+	}
+	if _, err := runGit("", nil, append([]string{"add", "--"}, files...)...); err != nil {
+		return err
+	}
+	staged, err := runGit("", nil, append([]string{"diff", "--cached", "--name-only", "--"}, files...)...)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(staged) == "" {
+		return nil // nothing actually changed
+	}
+	args := append([]string{"commit", "--only", "--no-verify", "--cleanup=verbatim", "-F", "-", "--"}, files...)
+	_, err = runGit(message, env, args...)
+	return err
+}
+
+// commitHumanChanges commits existing uncommitted changes to a single file
+// under the user's normal identity, before the AI touches it.
+func commitHumanChanges(path string) error {
+	if !gitEnabled {
+		return nil
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	status, err := runGit("", nil, "status", "--porcelain", "--", abs)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(status) == "" {
+		return nil
+	}
+	return commitFiles([]string{abs}, "Human edits to "+path+" (before AI edit)\n", nil)
+}
+
+// commitResult commits an AI change to one file and returns the tool result.
+// A failed commit does not fail the tool (the file was already written); it
+// adds a warning instead.
+func commitResult(okMsg, path, subject, detailLabel, detail, tool, note string) (string, error) {
+	if !gitEnabled {
+		return okMsg, nil
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return okMsg + " (warning: change not committed: " + err.Error() + ")", nil
+	}
+	if err := commitAI([]string{abs}, subject, detailLabel, detail, tool, note); err != nil {
+		fmt.Printf("[warning: AI change not committed: %v]\n", err)
+		return okMsg + " (warning: change not committed to git: " + err.Error() + ")", nil
+	}
+	return okMsg, nil
+}
+
+func commitAI(files []string, subject, detailLabel, detail, tool, note string) error {
+	version := currentModel
+	if version == "" {
+		version = string(model)
+	}
+	env := []string{
+		"GIT_AUTHOR_NAME=" + version,
+		"GIT_AUTHOR_EMAIL=" + aiAuthorEmail,
+	}
+
+	var sb strings.Builder
+	sb.WriteString(subject)
+	if s := promptSummary(currentPrompt); s != "" {
+		sb.WriteString(" - " + s)
+	}
+	sb.WriteString("\n\nPrompt:\n" + indent(currentPrompt) + "\n\n")
+	if detail != "" {
+		sb.WriteString(detailLabel + ":\n" + indent(detail) + "\n\n")
+	}
+	// Trailers must be the last paragraph.
+	sb.WriteString("AI-Model: " + version + "\n")
+	sb.WriteString("AI-Tool: " + tool + "\n")
+	sb.WriteString("AI-Response: " + lastResponseID + "\n")
+	sb.WriteString(fmt.Sprintf("AI-Tokens: %d in / %d out\n", lastUsage.InputTokens, lastUsage.OutputTokens))
+	sb.WriteString(fmt.Sprintf("AI-Tokens-Prompt-Total: %d in / %d out\n", promptUsage.InputTokens, promptUsage.OutputTokens))
+	if c, ok := estimateCostUSD(version, lastUsage); ok {
+		sb.WriteString(fmt.Sprintf("AI-Cost-USD: %.4f\n", c))
+	}
+	if c, ok := estimateCostUSD(version, promptUsage); ok {
+		sb.WriteString(fmt.Sprintf("AI-Cost-USD-Prompt-Total: %.4f\n", c))
+	}
+	if note != "" {
+		sb.WriteString("AI-Note: " + note + "\n")
+	}
+
+	return commitFiles(files, sb.String(), env)
+}
+
+func indent(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	return "    " + strings.ReplaceAll(strings.TrimSpace(s), "\n", "\n    ")
+}
+
+// promptSummary returns the first non-empty line, truncated, for the subject.
+func promptSummary(prompt string) string {
+	return truncate(firstLine(prompt), 50)
+}
+
+func firstLine(s string) string {
+	for _, line := range strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+func truncate(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "..."
+}
+
+// dirtySnapshot maps every changed/untracked file (path relative to repo root)
+// to a hash of its current content ("deleted" if missing).
+func dirtySnapshot() (map[string]string, error) {
+	out, err := runGit("", nil, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	if err != nil {
+		return nil, err
+	}
+	snap := map[string]string{}
+	entries := strings.Split(out, "\x00")
+	for i := 0; i < len(entries); i++ {
+		e := entries[i]
+		if len(e) < 4 {
+			continue
+		}
+		status, p := e[:2], e[3:]
+		if status[0] == 'R' || status[0] == 'C' {
+			i++ // skip the original path of a rename/copy
+		}
+		data, err := os.ReadFile(filepath.Join(repoRoot, p))
+		if err != nil {
+			snap[p] = "deleted"
+			continue
+		}
+		sum := sha256.Sum256(data)
+		snap[p] = hex.EncodeToString(sum[:])
+	}
+	return snap, nil
 }
 
 func SetTodos(input json.RawMessage) (string, error) {
@@ -529,6 +794,16 @@ func ExecuteCode(input json.RawMessage) (string, error) {
 		return "", fmt.Errorf("execution denied")
 	}
 
+	var before map[string]string
+	if gitEnabled {
+		var err error
+		before, err = dirtySnapshot()
+		if err != nil {
+			fmt.Printf("[warning: could not snapshot git state, command changes will not be tracked: %v]\n", err)
+			before = nil
+		}
+	}
+
 	var cmd *exec.Cmd
 
 	if runtime.GOOS == "windows" {
@@ -542,11 +817,64 @@ func ExecuteCode(input json.RawMessage) (string, error) {
 	}
 
 	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(output), fmt.Errorf("execution failed: %w", err)
+	result := string(output)
+
+	// Commit whatever the command changed, even if it exited non-zero.
+	if before != nil {
+		if warn := commitShellChanges(in.Code, before); warn != "" {
+			fmt.Println(warn)
+			result += "\n" + warn
+		}
 	}
 
-	return string(output), nil
+	if err != nil {
+		return result, fmt.Errorf("execution failed: %w", err)
+	}
+
+	return result, nil
+}
+
+// commitShellChanges commits files whose content differs from the snapshot
+// taken before the command ran. Returns a warning string on failure.
+func commitShellChanges(command string, before map[string]string) string {
+	after, err := dirtySnapshot()
+	if err != nil {
+		return "[warning: could not snapshot git state after command: " + err.Error() + "]"
+	}
+
+	var changed, preDirty []string
+	for p, h := range after {
+		bh, wasDirty := before[p]
+		if wasDirty && bh == h {
+			continue
+		}
+		changed = append(changed, p)
+		if wasDirty {
+			preDirty = append(preDirty, p)
+		}
+	}
+	if len(changed) == 0 {
+		return ""
+	}
+	sort.Strings(changed)
+	sort.Strings(preDirty)
+
+	abs := make([]string, len(changed))
+	for i, p := range changed {
+		abs[i] = filepath.Join(repoRoot, p)
+	}
+
+	note := ""
+	if len(preDirty) > 0 {
+		note = "these files had uncommitted changes before the command, so this commit may include human edits: " + strings.Join(preDirty, ", ")
+	}
+
+	subject := "AI shell: " + truncate(firstLine(command), 50)
+	detail := command + "\n\nFiles:\n" + strings.Join(changed, "\n")
+	if err := commitAI(abs, subject, "Command", detail, "execute_code", note); err != nil {
+		return "[warning: shell changes not committed to git: " + err.Error() + "]"
+	}
+	return ""
 }
 
 func requestPermission(code string) bool {
@@ -565,4 +893,13 @@ func shellDescription() string {
 		return "Windows (cmd.exe). Each call is a fresh shell; cd does not persist."
 	}
 	return runtime.GOOS + " (sh). Each call is a fresh shell; cd does not persist."
+}
+
+func estimateCostUSD(modelVersion string, u tokenUsage) (float64, bool) {
+	for prefix, p := range pricePerMTok {
+		if strings.HasPrefix(modelVersion, prefix) {
+			return (float64(u.InputTokens)*p[0] + float64(u.OutputTokens)*p[1]) / 1e6, true
+		}
+	}
+	return 0, false
 }
