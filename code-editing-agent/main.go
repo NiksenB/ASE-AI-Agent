@@ -82,8 +82,8 @@ const (
 // The committer stays the human (from their normal git config).
 const aiAuthorEmail = "noreply@anthropic.com"
 
-//var model = anthropic.ModelClaudeSonnet5_5
-var model = anthropic.ModelClaudeHaiku5_5
+var model = anthropic.ModelClaudeSonnet5_5
+//var model = anthropic.ModelClaudeHaiku5_5
 
 var lastContextTokens int64
 
